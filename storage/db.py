@@ -197,6 +197,51 @@ def save_checkpoint_entry(scraper_mode: str, level: str,
 # even when the local JSON file is gone (container restart).
 # ---------------------------------------------------------------------------
 
+def bootstrap_checkpoint_from_type_codes(scraper_mode: str):
+    """
+    One-time migration: populate scraper_checkpoints from existing type_codes.
+    Called automatically when checkpoint is empty but type_codes has data —
+    i.e. first deploy of the DB-checkpoint system, or after a table wipe.
+    Safe to call multiple times (ON CONFLICT DO NOTHING).
+    """
+    conn = _get_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scraper_checkpoints
+                    (scraper_mode, level, series, body, model, market, prod)
+                SELECT DISTINCT %s, 'model_market',
+                       series_value, COALESCE(body,''), model, market, ''
+                FROM type_codes WHERE scraper_mode = %s
+                ON CONFLICT DO NOTHING
+                """,
+                (scraper_mode, scraper_mode)
+            )
+            dm = cur.rowcount
+            cur.execute(
+                """
+                INSERT INTO scraper_checkpoints
+                    (scraper_mode, level, series, body, model, market, prod)
+                SELECT DISTINCT %s, 'prod',
+                       series_value, COALESCE(body,''), model, market, prod_month
+                FROM type_codes WHERE scraper_mode = %s
+                ON CONFLICT DO NOTHING
+                """,
+                (scraper_mode, scraper_mode)
+            )
+            dp = cur.rowcount
+        if dm or dp:
+            logger.info(
+                f"Bootstrapped checkpoint from type_codes: "
+                f"{dm} model_market + {dp} prod entries ({scraper_mode})"
+            )
+    except Exception as e:
+        logger.error(f"Failed to bootstrap checkpoint: {e}")
+
+
 def get_known_type_codes(scraper_mode: str) -> set:
     """
     Return all type_code_full values in DB for this scraper_mode.

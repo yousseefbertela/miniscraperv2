@@ -47,6 +47,15 @@ def load() -> dict:
     if cp is not None:
         return cp
 
+    # Checkpoint table is empty — try to bootstrap from existing type_codes
+    # (happens on first deploy of the DB-checkpoint system, or after table wipe)
+    logger.info("Checkpoint empty — bootstrapping from existing type_codes in DB …")
+    db.bootstrap_checkpoint_from_type_codes(SCRAPER_MODE)
+    cp = db.load_checkpoint(SCRAPER_MODE)
+    if cp is not None:
+        logger.info("Bootstrap succeeded — checkpoint loaded from type_codes.")
+        return cp
+
     # 2. Try local file
     path = _file()
     if os.path.exists(path):
