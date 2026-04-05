@@ -1,0 +1,40 @@
+version: "3.9"
+
+# EUR-LHD Scrapers — docker-compose for local testing and DigitalOcean
+#
+# Run both scrapers in parallel:
+#   docker compose up -d
+#
+# Run only one:
+#   docker compose up scraper-current
+#   docker compose up scraper-classic
+#
+# Credentials come from .env (copy .env.example → .env and fill in values).
+
+services:
+
+  scraper-current:
+    build: .
+    container_name: eur-lhd-current
+    env_file: .env
+    environment:
+      SCRAPER_MODE: current
+      HEADLESS: "true"
+      TEST_MODE: "false"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./output:/app/output
+    restart: "no"
+
+  scraper-classic:
+    build: .
+    container_name: eur-lhd-classic
+    env_file: .env
+    environment:
+      SCRAPER_MODE: classic
+      HEADLESS: "true"
+      TEST_MODE: "false"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./output:/app/output
+    restart: "no"

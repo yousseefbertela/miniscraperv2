@@ -1,0 +1,15 @@
+# Credentials — never commit
+.env
+
+# Output and checkpoints — large files, kept locally / in DB
+output/*.json
+test-data/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Logs
+*.log
