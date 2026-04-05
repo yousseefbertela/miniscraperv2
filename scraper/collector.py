@@ -1,29 +1,25 @@
 """
 scraper/collector.py — Core collection loop.
 
-Rules enforced here:
+Rules enforced:
   - EUR market only
-  - Left Hand Drive only (STRICT — no RHD fallback, enforced in discovery)
-  - Sample every 3rd production month: prods[::PROD_MONTH_STEP] → index 0, 3, 6, 9 …
-  - Skip diesel models (filters.is_diesel)
-  - Only collect brands in config.ALLOWED_BRANDS (detected from series label/value)
+  - Left Hand Drive only (STRICT — no RHD fallback)
+  - Sample every 3rd production month: prods[::PROD_MONTH_STEP]
+  - Skip diesel models
+  - Only collect brands in config.ALLOWED_BRANDS
+
+Speed design — navigations per model:
+  Old: get_markets(1) + get_prods(1) + per prod: get_engines(1) + get_transmissions(1)
+       + type_code attempt(1) + type_code steering retry(1) = 2 + 19*4 = 78 navs/model
+  New: get_prods_eur(1) + per prod: get_cars_for_prod(2) = 1 + 19*2 = 39 navs/model
+  Saving ~39 navs × 9s = ~5 min per model.
 
 Output structure:
 {
   "typecode#1 [1R11]": {
     "1. BMW E81 116i 1.6 EUR N43 20070300": {
       "type_code_full": "1R11-EUR-03-2007-E81-BMW-116i_1.6",
-      "series_value":   "E81",
-      "series_label":   "1' E81 (2006 — 2011)",
-      "body":           "HC",
-      "model":          "116i 1.6",
-      "market":         "EUR",
-      "engine":         "N43",
-      "transmission":   "",
-      "prod_month":     "20070300",
-      "steering":       "Left hand drive",
-      "brand":          "bmw",
-      "catalog":        "Current"
+      ...
     }
   }
 }
@@ -43,25 +39,16 @@ logger = logging.getLogger(__name__)
 
 def collect_all_type_codes(page, existing_data: dict) -> dict:
     """
-    Main entry point. Enumerates all series on the RealOEM select page,
-    filters by brand / market / steering / diesel rules, samples every 3rd
-    production month, and collects type_code_full values.
-
-    Parameters
-    ----------
-    page          : Playwright page object
-    existing_data : dict loaded from disk at startup (resume support)
-
-    Returns the fully populated output dict.
+    Main entry point. Enumerates all series, filters by brand / diesel / LHD,
+    samples every 3rd prod month, and collects type_code_full values.
     """
     result           = dict(existing_data)
     known_type_codes = get_all_known_type_codes(result)
 
-    # Load checkpoint for model/prod-level skipping on resume
     cp = ckpt.load()
     dm_set, dp_set = ckpt.build_sets(cp)
 
-    # Rebuild prefix → group number from existing data so numbering is consistent
+    # Rebuild prefix → group number from existing data
     prefix_to_num: dict[str, int] = {}
     for group_key in result:
         try:
@@ -84,7 +71,7 @@ def collect_all_type_codes(page, existing_data: dict) -> dict:
         return result
 
     # ------------------------------------------------------------------
-    # 2. Filter series to allowed brands
+    # 2. Filter by allowed brands
     # ------------------------------------------------------------------
     series_list = []
     skipped     = []
@@ -106,13 +93,13 @@ def collect_all_type_codes(page, existing_data: dict) -> dict:
     )
 
     # ------------------------------------------------------------------
-    # 3. Main loop: series → bodies → models → prod samples → engines
+    # 3. Main loop
     # ------------------------------------------------------------------
     for series_info in series_list:
         series_val   = series_info["value"]
         series_label = series_info["label"]
         brand        = series_info["brand"]
-        brand_label  = brand.upper().replace("_", " ")   # "BMW" / "MINI" / "ROLLS ROYCE"
+        brand_label  = brand.upper().replace("_", " ")
 
         logger.info(f"  [{brand_label}] Series: {series_label}  ({series_val})")
 
@@ -136,28 +123,22 @@ def collect_all_type_codes(page, existing_data: dict) -> dict:
                     logger.debug(f"      Skip diesel: {model_val}")
                     continue
 
-                # --- Checkpoint: skip fully-done model+market combos ---
+                # --- Checkpoint: skip fully-done model ---
                 if (series_val, body_val, model_val, MARKET) in dm_set:
                     logger.info(
                         f"      Skip (checkpoint): {series_val}/{body_val}/{model_val}"
                     )
                     continue
 
-                # --- EUR market availability check ---
-                avail_markets = disc.get_markets(page, series_val, body_val, model_val, CATALOG)
-                if MARKET not in avail_markets:
-                    logger.debug(
-                        f"      EUR not available for {series_val}/{body_val}/{model_val}"
-                    )
-                    continue
-
-                # --- Get all prod months, then sample every 3rd ---
-                all_prods = disc.get_prods(
-                    page, series_val, body_val, model_val, MARKET, CATALOG
-                )
+                # ----------------------------------------------------------
+                # ONE navigation: EUR market check + prod months combined
+                # (replaces old separate get_markets + get_prods = 2 navs)
+                # ----------------------------------------------------------
+                all_prods = disc.get_prods_eur(page, series_val, body_val, model_val, CATALOG)
                 if not all_prods:
-                    logger.warning(
-                        f"      No prod dates for {series_val}/{model_val}/{MARKET}"
+                    logger.debug(
+                        f"      EUR not available or no prods: "
+                        f"{series_val}/{body_val}/{model_val}"
                     )
                     continue
 
@@ -173,94 +154,79 @@ def collect_all_type_codes(page, existing_data: dict) -> dict:
                         logger.debug(f"        Skip prod (checkpoint): {prod}")
                         continue
 
-                    engines = disc.get_engines(
-                        page, series_val, body_val, model_val, MARKET, prod, CATALOG
+                    # ----------------------------------------------------------
+                    # TWO navigations per prod month: engines + type codes
+                    # (replaces old get_engines + get_transmissions + 2 type_code navs)
+                    # ----------------------------------------------------------
+                    cars = disc.get_cars_for_prod(
+                        page, series_val, body_val, model_val, prod, CATALOG
                     )
-                    if not engines:
-                        continue
 
-                    for engine in engines:
-                        # Check for transmission dropdown (returns [""] if none)
-                        transmissions = disc.get_transmissions(
-                            page, series_val, body_val, model_val,
-                            MARKET, prod, engine, CATALOG
+                    for car in cars:
+                        tc_full    = car["type_code_full"]
+                        engine     = car["engine"]
+                        steering   = car["steering"]
+                        trans_label = car["transmission"]
+
+                        if tc_full in known_type_codes:
+                            logger.info(f"        Skip (already collected): {tc_full}")
+                            continue
+
+                        # Group by 4-char prefix
+                        prefix = tc_full[:4]
+                        if prefix not in prefix_to_num:
+                            prefix_to_num[prefix] = next_group_num
+                            next_group_num += 1
+
+                        group_key = f"typecode#{prefix_to_num[prefix]} [{prefix}]"
+                        if group_key not in result:
+                            result[group_key] = {}
+
+                        variant_num  = len(result[group_key]) + 1
+                        trans_suffix = f" {trans_label}" if trans_label else ""
+                        variant_key  = (
+                            f"{variant_num}. {brand_label} {series_val}"
+                            f" {model_val} {MARKET} {engine}{trans_suffix} {prod}"
                         )
 
-                        for transmission in transmissions:
-                            result_tc = disc.get_type_code_full(
-                                page, series_val, body_val, model_val,
-                                MARKET, prod, engine, CATALOG,
-                                transmission=transmission,
-                            )
-                            if not result_tc:
-                                # None = no LHD available → skip this car
-                                continue
+                        result[group_key][variant_key] = {
+                            "type_code_full": tc_full,
+                            "series_value":   series_val,
+                            "series_label":   series_label,
+                            "body":           body_val,
+                            "model":          model_val,
+                            "market":         MARKET,
+                            "engine":         engine,
+                            "transmission":   trans_label,
+                            "prod_month":     prod,
+                            "steering":       steering,
+                            "brand":          brand,
+                            "catalog":        CATALOG,
+                        }
 
-                            tc_full    = result_tc["type_code_full"]
-                            steering   = result_tc.get("steering", "Left hand drive")
-                            trans_label = result_tc.get("transmission", "")
+                        known_type_codes.add(tc_full)
+                        total_added += 1
+                        logger.info(
+                            f"        + Added ({total_added} total): {tc_full}"
+                            + (f"  [{trans_label}]" if trans_label else "")
+                        )
 
-                            if tc_full in known_type_codes:
-                                logger.info(f"        Skip (already collected): {tc_full}")
-                                continue
+                        db.upsert(result[group_key][variant_key])
 
-                            # --- Group by 4-char prefix ---
-                            prefix = tc_full[:4]
-                            if prefix not in prefix_to_num:
-                                prefix_to_num[prefix] = next_group_num
-                                next_group_num += 1
-
-                            group_key = f"typecode#{prefix_to_num[prefix]} [{prefix}]"
-                            if group_key not in result:
-                                result[group_key] = {}
-
-                            # Build the variant key (human-readable label)
-                            variant_num  = len(result[group_key]) + 1
-                            trans_suffix = f" {trans_label}" if trans_label else ""
-                            variant_key  = (
-                                f"{variant_num}. {brand_label} {series_val}"
-                                f" {model_val} {MARKET} {engine}{trans_suffix} {prod}"
-                            )
-
-                            result[group_key][variant_key] = {
-                                "type_code_full": tc_full,
-                                "series_value":   series_val,
-                                "series_label":   series_label,
-                                "body":           body_val,
-                                "model":          model_val,
-                                "market":         MARKET,
-                                "engine":         engine,
-                                "transmission":   trans_label,
-                                "prod_month":     prod,
-                                "steering":       steering,
-                                "brand":          brand,
-                                "catalog":        CATALOG,
-                            }
-
-                            known_type_codes.add(tc_full)
-                            total_added += 1
-                            logger.info(
-                                f"        + Added ({total_added} total): {tc_full}"
-                                + (f"  [{trans_label}]" if trans_label else "")
-                            )
-
-                            # Insert into DB immediately — one row per car
-                            db.upsert(result[group_key][variant_key])
-
-                    # All engines for this prod done — mark prod complete
+                    # All engines for this prod done
                     ckpt.mark_prod_done(
                         cp, dm_set, dp_set,
                         series_val, body_val, model_val, MARKET, prod
                     )
 
-                # All sampled prods for this model done — save JSON + mark model complete
+                # All sampled prods for this model done
                 save(result)
                 ckpt.mark_model_market_done(
                     cp, dm_set,
                     series_val, body_val, model_val, MARKET
                 )
 
-    save(result)   # final flush
+    save(result)
     logger.info(
         f"Collection complete — {total_added} new type codes added, "
         f"{len(result)} prefix groups total."

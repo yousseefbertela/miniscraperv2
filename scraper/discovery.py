@@ -1,24 +1,29 @@
 """
 scraper/discovery.py — RealOEM dropdown enumeration via URL-param navigation.
 
-Navigation strategy:
-  Primary  : Build the full URL with all known params and parse the resulting HTML.
-             RealOEM pre-populates all dropdowns when params are in the URL, so
-             no JavaScript events need to fire — we just read the page source.
+Speed design:
+  Every URL param we know upfront gets baked into the URL so RealOEM
+  pre-populates all downstream dropdowns in one round-trip.
 
-  Fallback : Step-by-step form navigation. Each dropdown selection triggers a
-             GET reload, so we use page.expect_navigation() to wait for each.
-             Used when Browse Parts does not appear after the primary URL-param
-             approach (JS onChange dependency on some configurations).
+  Key optimisation: always include steering=L (RealOEM's LHD value) in
+  every URL that has an engine param. This means the Browse Parts button
+  appears in the SAME page that also gives us the engine list — collapsing
+  what was 4 navigations per prod month down to 2:
 
-Steering rule (STRICT_LHD=True):
-  - If steering dropdown is present and LHD option exists  → select LHD, continue.
-  - If steering dropdown is present and NO LHD             → return None (skip car).
-  - If no steering dropdown                               → proceed as-is.
+    Old (4 navs/prod):  get_engines | get_transmissions | type_code attempt | type_code retry
+    New (2 navs/prod):  get_prods_eur (EUR check + prods) | get_cars_for_prod (engines + type code)
 
-RealOEM catalog parameter:
-  archive=0  → Current catalog   (modern cars: F-series, G-series, etc.)
-  archive=1  → Classic catalog   (older cars: E36, E46, E90, etc.)
+  For 19 sampled prod months × 2 saved navs × ~9 s/nav = ~5 min saved per model.
+
+Fallback: step-by-step form navigation (page.expect_navigation) for the rare
+cases where Browse Parts requires JS onChange events to appear.
+
+Steering rule (STRICT_LHD):
+  - We always try steering=L first (RealOEM's Left Hand Drive URL value).
+  - If Browse Parts appears → done (no extra nav needed).
+  - If steering dropdown shows LHD but with a different value → retry (1 extra nav).
+  - If steering dropdown exists and NO LHD option → skip this car.
+  - If no steering dropdown at all → proceed as-is.
 """
 
 import re
@@ -27,7 +32,7 @@ import logging
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
-from scraper.browser import safe_goto, human_delay
+from scraper.browser import safe_goto
 from config import BMW_SELECT_URL, ACTION_DELAY, STRICT_LHD
 
 logger = logging.getLogger(__name__)
@@ -54,10 +59,7 @@ def _nav(page, catalog: str = "Current", **params) -> BeautifulSoup:
 
 
 def _read_select(soup, name: str) -> list:
-    """
-    Return [{value, label}, ...] from <select name=name>.
-    Skips blank rows and placeholder rows that start with '-'.
-    """
+    """Return [{value, label}] from <select name=name>, skipping blank/placeholder rows."""
     sel = soup.find("select", {"name": name})
     if not sel:
         return []
@@ -73,13 +75,10 @@ def _read_select(soup, name: str) -> list:
 
 def _extract_type_code(soup) -> str | None:
     """
-    Extract the type_code_full string from the Browse Parts button.
-
-    RealOEM renders Browse Parts as a <form action='/bmw/enUS/partgrp'>
-    with a hidden <input value='1R11-EUR-03-2007-E81-BMW-116i_1.6'>.
-    We check form hidden inputs first, then fall back to scanning <a> links.
+    Extract type_code_full from the Browse Parts button.
+    RealOEM renders it as a hidden input inside a form[action*=partgrp].
+    Falls back to scanning <a href> links.
     """
-    # Primary: hidden input inside a partgrp/showparts form
     for form in soup.find_all("form"):
         action = form.get("action", "")
         if "partgrp" in action or "showparts" in action:
@@ -88,7 +87,6 @@ def _extract_type_code(soup) -> str | None:
                 if val.count("-") >= 4:
                     return val
 
-    # Fallback: <a href> with id= param (older RealOEM layout)
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "partgrp" in href or "showparts" in href:
@@ -102,49 +100,40 @@ def _extract_type_code(soup) -> str | None:
 
 def _pick_lhd(steerings: list) -> dict | None:
     """
-    Return the Left Hand Drive option from the steering list.
-    If STRICT_LHD=True and no LHD found → return None (caller must skip car).
+    Return the LHD option from a steering list.
+    Returns None if STRICT_LHD=True and no LHD option exists.
     """
     lhd = next((s for s in steerings if "left" in s["label"].lower()), None)
     if lhd:
         return lhd
-    if STRICT_LHD:
-        return None    # strict: skip this car entirely
-    return steerings[0]
+    return None if STRICT_LHD else steerings[0]
 
 
 def _form_fallback(page, series: str, body: str, model: str,
                    market: str, prod: str, engine: str,
-                   catalog: str = "Current",
-                   transmission: str = "") -> str | None:
+                   catalog: str = "Current") -> str | None:
     """
     Step-by-step form fallback. Selects each dropdown in order, waiting for
-    the page to reload after each selection (RealOEM submits on change via GET).
-
-    Returns type_code_full string, or None if LHD unavailable or Browse Parts
-    does not appear after all selections.
+    the page to reload after each. Used when URL-param approach fails.
+    Returns type_code_full or None.
     """
     safe_goto(page, f"{BMW_SELECT_URL}?product=P&archive={'1' if catalog == 'Classic' else '0'}")
 
     def sel_nav(name: str, value: str) -> bool:
-        """Select a dropdown value and wait for the resulting page reload."""
-        selector = f"select[name='{name}']"
         try:
-            el = page.locator(selector).first
+            el = page.locator(f"select[name='{name}']").first
             el.wait_for(state="visible", timeout=12_000)
-            # Make sure the option actually exists before selecting
-            if page.locator(f"{selector} option[value='{value}']").count() == 0:
-                logger.warning(f"Form fallback: option {value!r} not found in {selector}")
+            if page.locator(f"select[name='{name}'] option[value='{value}']").count() == 0:
+                logger.warning(f"Form fallback: option {value!r} not found in {name}")
                 return False
             with page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
                 el.select_option(value=value)
             time.sleep(1.2)
             return True
         except Exception as e:
-            logger.warning(f"Form fallback: error selecting {value!r} in {selector}: {e}")
+            logger.warning(f"Form fallback: error selecting {value!r} in {name}: {e}")
             return False
 
-    # Required dropdowns in order
     if not sel_nav("series",  series):  return None
     if not sel_nav("body",    body):    return None
     if not sel_nav("model",   model):   return None
@@ -152,10 +141,9 @@ def _form_fallback(page, series: str, body: str, model: str,
     if not sel_nav("prod",    prod):    return None
     if not sel_nav("engine",  engine):  return None
 
-    # Steering — enforce STRICT_LHD
+    # Steering: enforce STRICT_LHD
     try:
-        steering_el = page.locator("select[name='steering']")
-        steering_el.wait_for(state="visible", timeout=4_000)
+        page.locator("select[name='steering']").wait_for(state="visible", timeout=4_000)
         opts = page.locator("select[name='steering'] option").all()
         steerings = [
             {"value": o.get_attribute("value") or "", "label": o.inner_text() or ""}
@@ -166,27 +154,12 @@ def _form_fallback(page, series: str, body: str, model: str,
         if steerings:
             chosen = _pick_lhd(steerings)
             if chosen is None:
-                logger.info(
-                    f"Form fallback: no LHD for "
-                    f"{series}/{model}/{market}/{prod}/{engine} — skipping"
-                )
+                logger.info(f"Form fallback: no LHD for {series}/{model} — skipping")
                 return None
             sel_nav("steering", chosen["value"])
     except Exception:
-        pass   # no steering dropdown — fine
+        pass
 
-    # Transmission (optional)
-    if transmission:
-        for t_name in ("trans", "transmission"):
-            try:
-                t_el = page.locator(f"select[name='{t_name}']").first
-                t_el.wait_for(state="visible", timeout=2_000)
-                sel_nav(t_name, transmission)
-                break
-            except Exception:
-                continue
-
-    # Wait for Browse Parts to appear (JS may add it asynchronously)
     try:
         page.wait_for_selector("form[action*='partgrp']", timeout=6_000)
     except Exception:
@@ -195,12 +168,11 @@ def _form_fallback(page, series: str, body: str, model: str,
         except Exception:
             pass
 
-    soup = BeautifulSoup(page.content(), "html.parser")
-    return _extract_type_code(soup)
+    return _extract_type_code(BeautifulSoup(page.content(), "html.parser"))
 
 
 # ---------------------------------------------------------------------------
-# Public discovery functions
+# Public discovery — series / bodies / models (unchanged, called once per series)
 # ---------------------------------------------------------------------------
 
 def get_all_series(page, catalog: str = "Current") -> list:
@@ -212,7 +184,6 @@ def get_all_series(page, catalog: str = "Current") -> list:
 
 
 def get_bodies(page, series: str, catalog: str = "Current") -> list:
-    """Return body type options for the given series."""
     soup   = _nav(page, catalog, series=series)
     bodies = _read_select(soup, "body")
     logger.debug(f"Series {series}: {len(bodies)} bodies")
@@ -220,154 +191,152 @@ def get_bodies(page, series: str, catalog: str = "Current") -> list:
 
 
 def get_models(page, series: str, body: str, catalog: str = "Current") -> list:
-    """Return model options for series + body."""
     soup   = _nav(page, catalog, series=series, body=body)
     models = _read_select(soup, "model")
     logger.debug(f"{series}/{body}: {len(models)} models")
     return models
 
 
-def get_markets(page, series: str, body: str, model: str,
-                catalog: str = "Current") -> list:
-    """Return available market value strings for series+body+model."""
-    soup    = _nav(page, catalog, series=series, body=body, model=model)
-    markets = [o["value"] for o in _read_select(soup, "market")]
-    logger.debug(f"{series}/{body}/{model} → markets: {markets}")
-    return markets
+# ---------------------------------------------------------------------------
+# Combined fast functions — each replaces 2-4 separate navigations
+# ---------------------------------------------------------------------------
 
+def get_prods_eur(page, series: str, body: str, model: str,
+                  catalog: str = "Current") -> list:
+    """
+    ONE navigation: navigate with market=EUR and return the prod month list.
+    Returns [] if EUR market is not available for this model (skip the model).
 
-def get_prods(page, series: str, body: str, model: str, market: str,
-              catalog: str = "Current") -> list:
-    """Return ALL production date values for the given combination."""
-    soup  = _nav(page, catalog, series=series, body=body, model=model, market=market)
+    Replaces the old separate get_markets (1 nav) + get_prods (1 nav) = 2 navs.
+    """
+    soup  = _nav(page, catalog, series=series, body=body, model=model, market="EUR")
     prods = [o["value"] for o in _read_select(soup, "prod")]
-    logger.debug(f"{series}/{model}/{market} → {len(prods)} prod dates")
+    if prods:
+        logger.debug(f"{series}/{body}/{model}: {len(prods)} EUR prod months")
+    else:
+        logger.debug(f"{series}/{body}/{model}: EUR not available or no prods")
     return prods
 
 
-def get_engines(page, series: str, body: str, model: str,
-                market: str, prod: str, catalog: str = "Current") -> list:
-    """Return all available engine codes."""
-    soup    = _nav(page, catalog, series=series, body=body, model=model,
-                   market=market, prod=prod)
+def get_cars_for_prod(page, series: str, body: str, model: str,
+                      prod: str, catalog: str = "Current") -> list:
+    """
+    TWO navigations per prod month (was 4):
+
+      Nav 1: URL(series, body, model, EUR, prod, steering=L)
+             → reads engine dropdown (replaces old get_engines nav)
+             → might already show type code if only 1 engine and L is correct
+
+      Nav 2 (per engine): URL(series, body, model, EUR, prod, engine, steering=L)
+             → gets type code (replaces old get_transmissions + 2 type_code navs)
+             → also reads transmission dropdown from same page if present
+
+    Returns list of {type_code_full, engine, steering, transmission}.
+    Returns [] if no engines found or no LHD available.
+    """
+    results = []
+
+    # ------------------------------------------------------------------
+    # Nav 1: get engine list.  steering=L included so that if there is
+    # only one engine AND L is the correct steering value, Browse Parts
+    # might already appear here (bonus: saves Nav 2 for those cases).
+    # ------------------------------------------------------------------
+    soup = _nav(page, catalog, series=series, body=body, model=model,
+                market="EUR", prod=prod, steering="L")
+
     engines = [o["value"] for o in _read_select(soup, "engine")]
-    logger.debug(f"Engines for {series}/{model}/{market}/{prod}: {engines}")
-    return engines
+    if not engines:
+        logger.debug(f"No engines for {series}/{model}/EUR/{prod}")
+        return results
 
+    logger.debug(f"Engines for {series}/{model}/EUR/{prod}: {engines}")
 
-def get_transmissions(page, series: str, body: str, model: str,
-                      market: str, prod: str, engine: str,
-                      catalog: str = "Current") -> list:
-    """
-    Check whether a transmission dropdown appears after engine selection.
-    Returns a list of transmission value strings, or [""] if no dropdown exists.
-
-    Some cars only reveal a transmission dropdown after steering is also set,
-    so we try a second time with LHD steering included.
-    """
-    soup = _nav(page, catalog, series=series, body=body, model=model,
-                market=market, prod=prod, engine=engine)
-
-    for field in ("trans", "transmission"):
-        opts = _read_select(soup, field)
-        if opts:
-            values = [o["value"] for o in opts]
-            logger.debug(f"Transmission ({field}): {values}")
-            return values
-
-    # Some cars only show transmission after steering — try with LHD
-    steerings = _read_select(soup, "steering")
-    if steerings:
-        chosen = _pick_lhd(steerings)
-        if chosen is None:
-            return [""]   # No LHD available — car will be skipped in get_type_code_full
+    for engine in engines:
+        # ------------------------------------------------------------------
+        # Nav 2: get type code with engine + steering=L.
+        # For the vast majority of EUR LHD cars this is the final step.
+        # ------------------------------------------------------------------
         soup2 = _nav(page, catalog, series=series, body=body, model=model,
-                     market=market, prod=prod, engine=engine,
-                     steering=chosen["value"])
-        for field in ("trans", "transmission"):
-            opts = _read_select(soup2, field)
-            if opts:
-                values = [o["value"] for o in opts]
-                logger.debug(f"Transmission after steering ({field}): {values}")
-                return values
+                     market="EUR", prod=prod, engine=engine, steering="L")
 
-    return [""]
-
-
-def get_type_code_full(page, series: str, body: str, model: str,
-                       market: str, prod: str, engine: str,
-                       catalog: str = "Current",
-                       transmission: str = "") -> dict | None:
-    """
-    Navigate with all known params and extract the type_code_full.
-
-    Steering logic (STRICT_LHD=True):
-      1. No steering dropdown → proceed (market is LHD-only).
-      2. Steering dropdown + LHD option → select LHD, continue.
-      3. Steering dropdown + no LHD → return None (skip this car entirely).
-
-    Falls back to step-by-step form navigation if URL-param approach
-    does not produce a Browse Parts button.
-
-    Returns {"type_code_full": str, "steering": str, "transmission": str}
-    or None if LHD not available or Browse Parts cannot be found.
-    """
-    extra = {}
-    if transmission:
-        extra["trans"] = transmission
-
-    soup = _nav(page, catalog, series=series, body=body, model=model,
-                market=market, prod=prod, engine=engine, **extra)
-
-    # Happy path — Browse Parts already visible
-    tc = _extract_type_code(soup)
-    if tc:
-        logger.info(f"Type code: {tc}")
-        return {"type_code_full": tc, "steering": "", "transmission": transmission}
-
-    # Steering dropdown present?
-    steerings = _read_select(soup, "steering")
-    if steerings:
-        chosen = _pick_lhd(steerings)
-        if chosen is None:
-            logger.info(
-                f"No LHD steering for {series}/{body}/{model}/{market}/{prod}/{engine} "
-                f"— skipping (STRICT_LHD)"
-            )
-            return None
-
-        logger.debug(f"Steering → {chosen['label']}")
-        soup2 = _nav(page, catalog, series=series, body=body, model=model,
-                     market=market, prod=prod, engine=engine,
-                     steering=chosen["value"], **extra)
         tc = _extract_type_code(soup2)
+
         if tc:
-            logger.info(f"Type code: {tc}  (steering: {chosen['label']})")
-            return {
+            # Check for a transmission dropdown on the SAME page (no extra nav)
+            trans_list = (
+                _read_select(soup2, "trans")
+                or _read_select(soup2, "transmission")
+            )
+            if trans_list:
+                # Transmission exists: need one nav per option (rare)
+                for t in trans_list:
+                    soup3 = _nav(page, catalog, series=series, body=body, model=model,
+                                 market="EUR", prod=prod, engine=engine,
+                                 steering="L", trans=t["value"])
+                    tc3 = _extract_type_code(soup3)
+                    if tc3:
+                        logger.info(f"Type code: {tc3}  [trans={t['label']}]")
+                        results.append({
+                            "type_code_full": tc3,
+                            "engine":         engine,
+                            "steering":       "Left hand drive",
+                            "transmission":   t["label"],
+                        })
+            else:
+                logger.info(f"Type code: {tc}")
+                results.append({
+                    "type_code_full": tc,
+                    "engine":         engine,
+                    "steering":       "Left hand drive",
+                    "transmission":   "",
+                })
+            continue
+
+        # ------------------------------------------------------------------
+        # steering=L didn't produce a type code.
+        # Check if a steering dropdown is present on this page.
+        # ------------------------------------------------------------------
+        steerings = _read_select(soup2, "steering")
+        if steerings:
+            lhd = _pick_lhd(steerings)
+            if lhd is None:
+                logger.info(
+                    f"No LHD for {series}/{model}/EUR/{prod}/{engine} "
+                    f"— skipping (STRICT_LHD)"
+                )
+                continue   # skip this engine (and car)
+
+            if lhd["value"] != "L":
+                # LHD exists but has a different value — one extra nav
+                soup3 = _nav(page, catalog, series=series, body=body, model=model,
+                             market="EUR", prod=prod, engine=engine,
+                             steering=lhd["value"])
+                tc = _extract_type_code(soup3)
+                if tc:
+                    logger.info(f"Type code: {tc}  (steering: {lhd['label']})")
+                    results.append({
+                        "type_code_full": tc,
+                        "engine":         engine,
+                        "steering":       lhd["label"],
+                        "transmission":   "",
+                    })
+                    continue
+
+        # ------------------------------------------------------------------
+        # URL-param approach failed entirely — use step-by-step form fallback
+        # ------------------------------------------------------------------
+        logger.info(
+            f"URL-param failed for {series}/{model}/EUR/{prod}/{engine} "
+            f"(catalog={catalog}) — trying form fallback"
+        )
+        tc = _form_fallback(page, series, body, model, "EUR", prod, engine, catalog)
+        if tc:
+            logger.info(f"Type code (form fallback): {tc}")
+            results.append({
                 "type_code_full": tc,
-                "steering":       chosen["label"],
-                "transmission":   transmission,
-            }
+                "engine":         engine,
+                "steering":       "Left hand drive",
+                "transmission":   "",
+            })
 
-    # URL-param approach failed — use step-by-step form fallback
-    logger.info(
-        f"URL-param failed for {series}/{body}/{model}/{market}/{prod}/{engine} "
-        f"(catalog={catalog}) — trying form fallback"
-    )
-    tc = _form_fallback(
-        page, series, body, model, market, prod, engine,
-        catalog=catalog, transmission=transmission,
-    )
-    if tc:
-        logger.info(f"Type code (form fallback): {tc}")
-        return {
-            "type_code_full": tc,
-            "steering":       "Left hand drive",
-            "transmission":   transmission,
-        }
-
-    logger.warning(
-        f"No Browse Parts found for "
-        f"{series}/{body}/{model}/{market}/{prod}/{engine} (catalog={catalog})"
-    )
-    return None
+    return results
