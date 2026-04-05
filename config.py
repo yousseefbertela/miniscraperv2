@@ -5,7 +5,10 @@ Controlled entirely by the SCRAPER_MODE environment variable:
   SCRAPER_MODE=current  →  Scraper 1: EUR-LHD-CURRENT  (BMW + MINI + Rolls Royce)
   SCRAPER_MODE=classic  →  Scraper 2: EUR-LHD-CLASSIC  (BMW only)
 
-Set HEADLESS=true for server/Docker runs (default: false = headed for local).
+Browser always runs headed (headless=False). On the server, Xvfb provides a
+virtual display so headed Chrome can run without a physical screen.
+This bypasses Cloudflare which blocks headless Chrome.
+
 Set TEST_MODE=true to write output to test-data/ instead of output/.
 """
 
@@ -28,7 +31,6 @@ if _env.exists():
 # ---------------------------------------------------------------------------
 SCRAPER_MODE = os.getenv("SCRAPER_MODE", "current").lower()   # "current" | "classic"
 TEST_MODE    = os.getenv("TEST_MODE",    "false").lower() == "true"
-HEADLESS     = os.getenv("HEADLESS",     "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # URLs
@@ -36,7 +38,7 @@ HEADLESS     = os.getenv("HEADLESS",     "false").lower() == "true"
 BMW_SELECT_URL = "https://www.realoem.com/bmw/enUS/select"
 
 # ---------------------------------------------------------------------------
-# Human-like delay ranges (seconds) — keep low, RealOEM is fast
+# Human-like delay ranges (seconds)
 # ---------------------------------------------------------------------------
 PAGE_LOAD_DELAY = (0.1, 0.2)
 ACTION_DELAY    = (0.05, 0.1)
@@ -72,7 +74,6 @@ CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, _CKPT_NAME)
 
 # ---------------------------------------------------------------------------
 # Database — DigitalOcean PostgreSQL
-# Set via .env locally, or via Docker/DO environment variables on server.
 # ---------------------------------------------------------------------------
 DB_HOST     = os.getenv("DB_HOST",     "")
 DB_PORT     = os.getenv("DB_PORT",     "25060")

@@ -1,14 +1,16 @@
 # EUR-LHD Scraper — production Docker image
 # Designed for DigitalOcean App Platform (Worker type)
 #
-# Build:     docker build -t eur-lhd-scraper .
-# Run:       docker run --env-file .env eur-lhd-scraper
-# DO deploy: set SCRAPER_MODE=current or classic in App Platform env vars
+# Always runs headed Chrome via Xvfb virtual display.
+# This bypasses Cloudflare — headless Chrome gets blocked instantly.
+# Same pattern as our main RealOEM scraper.
 
 FROM python:3.11-slim
 
-# System dependencies required by Chromium
+# System dependencies for headed Chromium + Xvfb virtual display
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    xauth \
     ca-certificates curl wget gnupg \
     libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
     libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 \
@@ -27,7 +29,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright: install Chromium browser + OS-level deps
+# Playwright: install Chromium + OS-level deps
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN playwright install chromium
 RUN playwright install-deps chromium
@@ -38,7 +40,6 @@ RUN mkdir -p /app/output /app/test-data
 
 # Runtime defaults — override via DO App Platform env vars
 ENV PYTHONUNBUFFERED=1
-ENV HEADLESS=true
 ENV SCRAPER_MODE=current
 ENV TEST_MODE=false
 ENV DB_HOST=""

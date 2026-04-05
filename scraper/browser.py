@@ -1,9 +1,13 @@
 """
 scraper/browser.py — Browser launch and navigation helpers.
 
-Headed Chrome by default (same as our project style).
-Set HEADLESS=true for Docker/server runs.
-playwright-stealth removes automation fingerprints.
+Always runs headed Chrome (headless=False) — same as our main scraper.
+On the server (Docker/DigitalOcean), a Xvfb virtual display is started
+first so headed Chrome has a display to render into.
+This is what bypasses Cloudflare — headless Chrome gets blocked instantly.
+
+Call start_virtual_display() at the top of main(), then launch_browser(),
+then stop_virtual_display() in the finally block.
 """
 
 import random
@@ -19,44 +23,71 @@ _USER_AGENT = (
     "Chrome/135.0.0.0 Safari/537.36"
 )
 
+_virtual_display = None
+
 
 class BrowserCrashError(RuntimeError):
-    """Raised when Chromium crashes — tells the caller to restart the browser."""
+    """Raised when Chromium crashes — signals caller to restart the browser."""
     pass
 
 
 # ---------------------------------------------------------------------------
-# Launch
+# Virtual display (Xvfb) — Linux server only
+# ---------------------------------------------------------------------------
+
+def start_virtual_display():
+    """
+    Start a Xvfb virtual display so headed Chrome can run on a headless server.
+    No-op on Windows or if pyvirtualdisplay is not installed.
+    """
+    global _virtual_display
+    try:
+        from pyvirtualdisplay import Display
+        _virtual_display = Display(visible=False, size=(1920, 1080))
+        _virtual_display.start()
+        logger.info("Xvfb virtual display started (1920x1080)")
+    except Exception as e:
+        logger.info(f"Virtual display not started ({e}) — continuing without it")
+        _virtual_display = None
+
+
+def stop_virtual_display():
+    """Stop the Xvfb virtual display if one was started."""
+    global _virtual_display
+    if _virtual_display is not None:
+        try:
+            _virtual_display.stop()
+            logger.info("Virtual display stopped.")
+        except Exception:
+            pass
+        _virtual_display = None
+
+
+# ---------------------------------------------------------------------------
+# Browser launch — always headed
 # ---------------------------------------------------------------------------
 
 def launch_browser(playwright_instance) -> tuple:
     """
-    Launch Chrome with stealth patches applied.
+    Launch headed Chrome with stealth patches applied.
     Returns (browser, context, page).
-    Headed by default; set HEADLESS=true in env for server/Docker.
+    Always headed (headless=False) — Xvfb provides the display on the server.
     """
-    from config import HEADLESS
-
-    args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-infobars",
-        "--disable-extensions",
-        "--window-size=1920,1080",
-    ]
-    if not HEADLESS:
-        args.append("--start-maximized")
-    else:
-        args += ["--disable-gpu", "--disable-software-rasterizer"]
-
     proxy_url = __import__("os").getenv("PROXY_URL", "").strip()
     proxy_cfg = {"server": proxy_url} if proxy_url else None
 
     browser: Browser = playwright_instance.chromium.launch(
-        headless=HEADLESS,
-        args=args,
+        headless=False,   # always headed — Cloudflare defeats headless Chrome
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--disable-extensions",
+            "--window-size=1920,1080",
+            "--start-maximized",
+        ],
         proxy=proxy_cfg,
     )
 
@@ -81,7 +112,7 @@ def launch_browser(playwright_instance) -> tuple:
 
     page: Page = context.new_page()
 
-    # Apply playwright-stealth to hide webdriver flag and other automation signals
+    # Apply playwright-stealth to remove webdriver fingerprints
     try:
         from playwright_stealth import Stealth as _Stealth
         _Stealth().apply_stealth_sync(page)
@@ -89,7 +120,6 @@ def launch_browser(playwright_instance) -> tuple:
     except Exception as e:
         logger.warning(f"playwright-stealth not applied: {e} — continuing without it")
 
-    # Extra JS patches that stealth sometimes misses
     page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
@@ -98,7 +128,7 @@ def launch_browser(playwright_instance) -> tuple:
     """)
 
     page.set_default_timeout(60_000)
-    logger.info(f"Browser launched ({'headless' if HEADLESS else 'headed'} Chrome)")
+    logger.info("Browser launched (headed Chrome + stealth)")
     return browser, context, page
 
 
@@ -119,7 +149,7 @@ def human_scroll(page: Page):
 # Cloudflare challenge detection
 # ---------------------------------------------------------------------------
 
-def wait_for_no_cloudflare(page: Page, timeout: int = 90):
+def wait_for_no_cloudflare(page: Page, timeout: int = 60):
     """Poll until Cloudflare challenge clears or timeout is reached."""
     start = time.time()
     while True:
@@ -143,7 +173,7 @@ def wait_for_no_cloudflare(page: Page, timeout: int = 90):
                 "Consider using a residential proxy."
             )
         logger.warning(f"Cloudflare challenge active … ({elapsed:.0f}s)")
-        time.sleep(3)
+        time.sleep(2)
 
 
 # ---------------------------------------------------------------------------
