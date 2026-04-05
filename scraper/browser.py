@@ -1,26 +1,29 @@
 """
 scraper/browser.py — Browser launch and navigation helpers.
 
-Always runs headed Chrome (headless=False) — same as our main scraper.
-On the server (Docker/DigitalOcean), a Xvfb virtual display is started
-first so headed Chrome has a display to render into.
-This is what bypasses Cloudflare — headless Chrome gets blocked instantly.
+Mirrors the main RealOEM scraper browser.py exactly — same Chrome version,
+same args, same stealth setup — because that scraper has no Cloudflare issues.
 
-Call start_virtual_display() at the top of main(), then launch_browser(),
-then stop_virtual_display() in the finally block.
+Key points:
+  - Always headless=False (headed Chrome)
+  - Xvfb virtual display on Linux server (pyvirtualdisplay)
+  - playwright-stealth==2.0.1 (pinned — version matters for stealth quality)
+  - Chrome/124 user agent (matches what stealth expects)
+  - No extra add_init_script on top of stealth (stealth handles it all)
 """
 
 import random
 import time
 import logging
 from playwright.sync_api import Page, Browser, BrowserContext
+from playwright_stealth import Stealth as _Stealth
 
 logger = logging.getLogger(__name__)
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/135.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 _virtual_display = None
@@ -64,31 +67,24 @@ def stop_virtual_display():
 
 
 # ---------------------------------------------------------------------------
-# Browser launch — always headed
+# Browser launch — always headed, same setup as main scraper
 # ---------------------------------------------------------------------------
 
 def launch_browser(playwright_instance) -> tuple:
     """
-    Launch headed Chrome with stealth patches applied.
-    Returns (browser, context, page).
-    Always headed (headless=False) — Xvfb provides the display on the server.
+    Launch headed Chrome with stealth. Returns (browser, context, page).
+    Identical to the main RealOEM scraper's launch_browser.
     """
-    proxy_url = __import__("os").getenv("PROXY_URL", "").strip()
-    proxy_cfg = {"server": proxy_url} if proxy_url else None
-
     browser: Browser = playwright_instance.chromium.launch(
-        headless=False,   # always headed — Cloudflare defeats headless Chrome
+        headless=False,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-infobars",
-            "--disable-extensions",
             "--window-size=1920,1080",
             "--start-maximized",
         ],
-        proxy=proxy_cfg,
     )
 
     context: BrowserContext = browser.new_context(
@@ -104,30 +100,12 @@ def launch_browser(playwright_instance) -> tuple:
                 "text/html,application/xhtml+xml,application/xml;"
                 "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
             ),
-            "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
         },
     )
 
     page: Page = context.new_page()
-
-    # Apply playwright-stealth to remove webdriver fingerprints
-    try:
-        from playwright_stealth import Stealth as _Stealth
-        _Stealth().apply_stealth_sync(page)
-        logger.info("playwright-stealth applied")
-    except Exception as e:
-        logger.warning(f"playwright-stealth not applied: {e} — continuing without it")
-
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {} };
-    """)
-
-    page.set_default_timeout(60_000)
+    _Stealth().apply_stealth_sync(page)
+    page.set_default_timeout(45_000)
     logger.info("Browser launched (headed Chrome + stealth)")
     return browser, context, page
 
@@ -137,7 +115,9 @@ def launch_browser(playwright_instance) -> tuple:
 # ---------------------------------------------------------------------------
 
 def human_delay(range_tuple: tuple):
-    time.sleep(random.uniform(*range_tuple))
+    duration = random.uniform(*range_tuple)
+    logger.debug(f"Sleeping {duration:.1f}s")
+    time.sleep(duration)
 
 
 def human_scroll(page: Page):
@@ -153,19 +133,11 @@ def wait_for_no_cloudflare(page: Page, timeout: int = 60):
     """Poll until Cloudflare challenge clears or timeout is reached."""
     start = time.time()
     while True:
-        try:
-            title = page.title().lower()
-        except Exception:
-            title = ""
-
-        if "just a moment" not in title and "checking your browser" not in title:
-            try:
-                cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
-                if not cf_frames:
-                    return
-            except Exception:
+        title = page.title()
+        if "just a moment" not in title.lower():
+            cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
+            if not cf_frames:
                 return
-
         elapsed = time.time() - start
         if elapsed > timeout:
             raise TimeoutError(
@@ -174,6 +146,33 @@ def wait_for_no_cloudflare(page: Page, timeout: int = 60):
             )
         logger.warning(f"Cloudflare challenge active … ({elapsed:.0f}s)")
         time.sleep(2)
+
+
+# ---------------------------------------------------------------------------
+# Popup dismissal
+# ---------------------------------------------------------------------------
+
+_CLOSE_SELECTORS = [
+    "button[class*=close]", "button[class*=dismiss]",
+    "button[aria-label*=Close]", "a[class*=close]",
+    "div[class*=close-btn]", "span[class*=close]",
+    "[class*=overlay] button", "[class*=modal] button", "[class*=popup] button",
+]
+
+def dismiss_popups(page: Page):
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
+    except Exception:
+        pass
+    for sel in _CLOSE_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=300):
+                btn.click(timeout=500)
+                time.sleep(0.2)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +187,13 @@ def safe_goto(page: Page, url: str, retries: int = 3):
     for attempt in range(1, max_tries + 1):
         try:
             logger.debug(f"→ {url}  (attempt {attempt})")
-            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             try:
-                page.wait_for_load_state("networkidle", timeout=3_000)
+                page.wait_for_load_state("networkidle", timeout=1_000)
             except Exception:
                 pass
             wait_for_no_cloudflare(page)
+            dismiss_popups(page)
             human_delay(PAGE_LOAD_DELAY)
             return
         except BrowserCrashError:

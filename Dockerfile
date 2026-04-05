@@ -2,25 +2,32 @@
 # Designed for DigitalOcean App Platform (Worker type)
 #
 # Always runs headed Chrome via Xvfb virtual display.
-# This bypasses Cloudflare — headless Chrome gets blocked instantly.
-# Same pattern as our main RealOEM scraper.
+# Mirrors the setup of our main RealOEM scraper exactly.
 
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 # System dependencies for headed Chromium + Xvfb virtual display
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     xauth \
-    ca-certificates curl wget gnupg \
-    libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
-    libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 \
-    libfontconfig1 libgbm1 libgcc-s1 libglib2.0-0 \
-    libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 \
-    libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcb-dri3-0 \
-    libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 \
-    libxi6 libxkbcommon0 libxrandr2 libxrender1 libxss1 libxtst6 \
-    fonts-liberation fonts-noto-color-emoji \
-    xdg-utils libu2f-udev libvulkan1 \
+    libglib2.0-0 \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2-dev \
+    libpangocairo-1.0-0 \
+    libpango-1.0-0 \
+    libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -29,10 +36,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright: install Chromium + OS-level deps
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Playwright: install Chromium + all OS-level deps in one command (same as main scraper)
+RUN playwright install chromium --with-deps
 
 # Project source
 COPY . .
