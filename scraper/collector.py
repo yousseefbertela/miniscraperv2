@@ -171,10 +171,14 @@ def collect_series_slice(page, series_slice: list, state: SharedState,
                     continue
 
                 sampled = all_prods[::PROD_MONTH_STEP]
+                # Always include the very last prod month (most recent)
+                # in case it wasn't naturally hit by the step
+                if all_prods[-1] not in sampled:
+                    sampled = sampled + [all_prods[-1]]
                 logger.info(
                     f"{tag} {series_val}/{body_val}/{model_val}: "
                     f"{len(all_prods)} prod months → sampling {len(sampled)} "
-                    f"(every {PROD_MONTH_STEP}rd)"
+                    f"(every {PROD_MONTH_STEP}th + last)"
                 )
 
                 for prod in sampled:

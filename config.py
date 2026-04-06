@@ -49,7 +49,7 @@ MAX_RETRIES     = 3
 # Scrape rules (same for both scrapers)
 # ---------------------------------------------------------------------------
 MARKET          = "EUR"
-PROD_MONTH_STEP = 3       # sample every 3rd prod month: index 0, 3, 6, 9 ...
+PROD_MONTH_STEP = 6       # sample every 6th prod month: index 0, 6, 12 … + always last
 STRICT_LHD      = True    # if steering dropdown exists and LHD not available → skip car
 
 # ---------------------------------------------------------------------------
